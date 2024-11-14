@@ -63,6 +63,7 @@ type TransactionFuture<Err> = Pin<
             + Send,
     >,
 >;
+type AnyFuture<Err, T> = Pin<Box<dyn Future<Output = Result<T, Err>> + Send>>;
 
 type AccountInfoSender = OneshotSender<DatabaseResult<AccountInfo>>;
 type StorageSender = OneshotSender<DatabaseResult<U256>>;
@@ -74,6 +75,28 @@ type TransactionSender = OneshotSender<DatabaseResult<WithOtherFields<Transactio
 type AddressData = AddressHashMap<AccountInfo>;
 type StorageData = AddressHashMap<StorageInfo>;
 type BlockHashData = HashMap<U256, B256>;
+struct AnyRequest<Err, T> {
+    future: AnyFuture<Err, T>,
+    sender: OneshotSender<Result<T, Err>>,
+}
+trait AnyRequestTrait<Err> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()>;
+}
+impl<Err, T> AnyRequestTrait<Err> for AnyRequest<Err, T>
+where
+    Err: Send + 'static,
+    T: Send + 'static,
+{
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        match self.future.as_mut().poll(cx) {
+            Poll::Ready(result) => {
+                let _ = self.sender.send(result);
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
 
 /// Request variants that are executed by the provider
 enum ProviderRequest<Err> {
@@ -82,10 +105,10 @@ enum ProviderRequest<Err> {
     BlockHash(BlockHashFuture<Err>),
     FullBlock(FullBlockFuture<Err>),
     Transaction(TransactionFuture<Err>),
+    Any(Box<dyn AnyRequestTrait<Err> + Send>),
 }
 
 /// The Request type the Backend listens for
-#[derive(Debug)]
 enum BackendRequest {
     /// Fetch the account info
     Basic(Address, AccountInfoSender),
@@ -106,6 +129,48 @@ enum BackendRequest {
     UpdateStorage(StorageData),
     /// Update Block Hashes
     UpdateBlockHash(BlockHashData),
+
+    AnyRequest(Box<dyn AnyRequestTrait<eyre::Report> + Send>),
+}
+
+impl std::fmt::Debug for BackendRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BackendRequest::Basic(address, _) => {
+                f.debug_tuple("Basic").field(address).field(&"<AccountInfoSender>").finish()
+            }
+            BackendRequest::Storage(address, index, _) => f
+                .debug_tuple("Storage")
+                .field(address)
+                .field(index)
+                .field(&"<StorageSender>")
+                .finish(),
+            BackendRequest::BlockHash(number, _) => {
+                f.debug_tuple("BlockHash").field(number).field(&"<BlockHashSender>").finish()
+            }
+            BackendRequest::FullBlock(block_id, _) => {
+                f.debug_tuple("FullBlock").field(block_id).field(&"<FullBlockSender>").finish()
+            }
+            BackendRequest::Transaction(hash, _) => {
+                f.debug_tuple("Transaction").field(hash).field(&"<TransactionSender>").finish()
+            }
+            BackendRequest::SetPinnedBlock(block_id) => {
+                f.debug_tuple("SetPinnedBlock").field(block_id).finish()
+            }
+            BackendRequest::UpdateAddress(_) => {
+                f.debug_tuple("UpdateAddress").field(&"<AddressData>").finish()
+            }
+            BackendRequest::UpdateStorage(_) => {
+                f.debug_tuple("UpdateStorage").field(&"<StorageData>").finish()
+            }
+            BackendRequest::UpdateBlockHash(_) => {
+                f.debug_tuple("UpdateBlockHash").field(&"<BlockHashData>").finish()
+            }
+            BackendRequest::AnyRequest(_) => {
+                f.debug_tuple("AnyRequest").field(&"<AnyRequest>").finish()
+            }
+        }
+    }
 }
 
 /// Handles an internal provider and listens for requests.
@@ -219,6 +284,9 @@ where
                 for (block, hash) in block_hash_data {
                     self.db.block_hashes().write().insert(block, hash);
                 }
+            }
+            BackendRequest::AnyRequest(any_request) => {
+                self.pending_requests.push(ProviderRequest::Any(any_request));
             }
         }
     }
@@ -512,6 +580,11 @@ where
                             continue;
                         }
                     }
+                    ProviderRequest::Any(any_request) => {
+                        if let Poll::Ready(()) = any_request.poll(cx) {
+                            continue;
+                        }
+                    }
                 }
                 // not ready, insert and poll again
                 pin.pending_requests.push(request);
@@ -763,6 +836,39 @@ impl SharedBackend {
             }
         }
     }
+    /// Sends an arbitrary request to the backend handler.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// let future = async {
+    ///     // Your custom request logic here
+    /// };
+    ///
+    /// let receiver = shared_backend.do_any_request(future)?;
+    /// let result = receiver.recv()?;
+    /// ```
+    pub fn do_any_request<T, F>(
+        &self,
+        future: F,
+    ) -> eyre::Result<std::sync::mpsc::Receiver<Result<T, eyre::Report>>>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T, eyre::Report>> + Send + 'static,
+    {
+        // Create a oneshot channel to receive the result
+        let (sender, receiver) = oneshot_channel();
+
+        // Create the custom request
+        let any_request = AnyRequest { future: Box::pin(future), sender };
+
+        // Send the custom request to the BackendHandler
+        let req = BackendRequest::AnyRequest(Box::new(any_request));
+        self.backend.unbounded_send(req).map_err(|e| eyre::eyre!("{:?}", e))?;
+
+        // Return the receiver to the user
+        Ok(receiver)
+    }
 
     /// Flushes the DB to disk if caching is enabled
     pub fn flush_cache(&self) {
@@ -866,7 +972,8 @@ mod tests {
             .on_client(ClientBuilder::default().http(endpoint.parse().unwrap()))
     }
 
-    const ENDPOINT: Option<&str> = option_env!("ETH_RPC_URL");
+    //TODO: change back
+    const ENDPOINT: Option<&str> = Some("https://sepolia.era.zksync.dev");
 
     #[tokio::test(flavor = "multi_thread")]
     async fn shared_backend() {
