@@ -129,7 +129,7 @@ enum BackendRequest {
     UpdateStorage(StorageData),
     /// Update Block Hashes
     UpdateBlockHash(BlockHashData),
-
+    /// Any other request
     AnyRequest(Box<dyn AnyRequestTrait<eyre::Report> + Send>),
 }
 
@@ -857,17 +857,14 @@ impl SharedBackend {
         T: Send + 'static,
         F: Future<Output = Result<T, eyre::Report>> + Send + 'static,
     {
-        // Create a oneshot channel to receive the result
         let (sender, receiver) = oneshot_channel();
 
         // Create the custom request
         let any_request = AnyRequest { future: Box::pin(future), sender };
-
         // Send the custom request to the BackendHandler
         let req = BackendRequest::AnyRequest(Box::new(any_request));
         self.backend.unbounded_send(req).map_err(|e| eyre::eyre!("{:?}", e))?;
 
-        // Return the receiver to the user
         Ok(receiver)
     }
 
@@ -1367,6 +1364,8 @@ mod tests {
 
         // Define the custom future to send via AnyRequest
         // This could be any custom request that the provider supports
+        // So thinking out loud, using alloy-zksync provider, we could send a request to
+        // `get_bytecode_by_hash`
         let provider_clone = provider.clone();
         let custom_future = async move {
             let code =
