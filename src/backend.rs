@@ -133,6 +133,7 @@ enum BackendRequest {
     AnyRequest(Box<dyn AnyRequestTrait<eyre::Report> + Send>),
 }
 
+// TODO: do I need to implement Debug for BackendRequest manually like this?
 impl std::fmt::Debug for BackendRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1346,5 +1347,44 @@ mod tests {
 
         // erase the temporary file
         fs::remove_file("test-data/storage-tmp.json").unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn can_send_any_request() {
+        let Some(endpoint) = ENDPOINT else { return };
+
+        let provider = Arc::new(get_http_provider(endpoint));
+        let meta = BlockchainDbMeta {
+            cfg_env: Default::default(),
+            block_env: Default::default(),
+            hosts: BTreeSet::from([endpoint.to_string()]),
+        };
+
+        let db = BlockchainDb::new(meta, None);
+        let backend = SharedBackend::spawn_backend(provider.clone(), db.clone(), None).await;
+        // Dummy address
+        let address: Address = "0000000000000000000000000000000000000000".parse().unwrap();
+
+        // Define the custom future to send via AnyRequest
+        // This could be any custom request that the provider supports
+        let provider_clone = provider.clone();
+        let custom_future = async move {
+            let code =
+                provider_clone.get_code_at(address).await.map_err(|e| eyre::Report::from(e))?;
+            let bytecode = Bytecode::new_raw(code);
+            Ok(bytecode)
+        };
+
+        let receiver = backend.do_any_request(custom_future).unwrap();
+        let result = receiver.recv().unwrap();
+
+        match result {
+            Ok(bytecode) => {
+                assert!(!bytecode.bytecode().is_empty(), "Expected bytecode to be non-empty");
+            }
+            Err(err) => {
+                panic!("Error occurred during AnyRequest: {:?}", err);
+            }
+        }
     }
 }
